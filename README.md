@@ -19,44 +19,67 @@ Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16. Hardware: 2× V100 SXM2 (32
 
 ---
 
-## Architecture
+## Architectures
+
+### Single-Process (`single-process/`)
+
+One Python process owns both GPUs. Weight matrices are split manually; results are combined with `.to()` tensor copies routed through the CPU driver.
 
 ```mermaid
 flowchart TD
-    Client(["HTTP Clients\nPOST /generate\nGET /health\nGET /metrics"])
-    Prometheus(["Prometheus\nscrapes /metrics"])
-    Grafana(["Grafana\ndashboards"])
+    Client(["Client"])
 
-    subgraph Docker Compose
-        API["FastAPI Server\nserver.py"]
-        Metrics["/metrics endpoint"]
-        Redis[("Redis\nqueue")]
-        Scheduler["Scheduler\nbatch window 50ms / max 8"]
+    subgraph SingleProcess["Single Python Process"]
+        API["FastAPI\nserver.py"]
+        Scheduler["Scheduler\n50ms batch window"]
+        Redis[("Redis")]
+        Engine["engine.py"]
 
-        subgraph InferenceEngine["Inference Engine — engine.py"]
-            GPU0["GPU 0\n7 GB — W_left"]
-            GPU1["GPU 1\n7 GB — W_right"]
-            GPU0 -- "all-reduce\n(sum partial results)" --> GPU1
+        subgraph Forward["Forward Pass — one Python thread"]
+            direction LR
+            GPU0["GPU 0\nW_gate[:half]\nW_up[:half]\nW_down[:,:half]"]
+            GPU1["GPU 1\nW_gate[half:]\nW_up[half:]\nW_down[:,half:]"]
+            GPU0 -. "out1.to(GPU0)\nhost-mediated DMA\n~25µs per transfer" .-> GPU0
+            GPU1 -. " " .-> GPU0
         end
     end
 
     Client -->|"POST /generate"| API
-    API --> Metrics
     API --> Scheduler
-    Scheduler -->|"enqueue"| Redis
-    Redis -->|"dequeue batch"| Scheduler
-    Scheduler -->|"engine.generate(batch)"| InferenceEngine
-    Prometheus -->|"scrape"| Metrics
-    Grafana -->|"query"| Prometheus
+    Scheduler --> Redis
+    Redis --> Scheduler
+    Scheduler --> Engine
+    Engine --> Forward
 ```
 
-**Request flow:**
-1. Client sends `POST /generate` with a prompt
-2. FastAPI handler enqueues it in Redis and awaits a Future
-3. Scheduler batch loop collects requests for 50ms (or until batch=8)
-4. Engine runs one GPU forward pass on the whole batch
-5. With 2 GPUs: weights are split across both GPUs (`parallelism_mode` controls strategy — column-parallel or Megatron col/row alternation)
-6. Futures resolved, responses returned
+### Multi-Process NCCL (`multi-process/`)
+
+One OS process per GPU. Each process has its own Python interpreter. Communication goes directly between GPU SRAMs via NCCL — no CPU involved.
+
+```mermaid
+flowchart TD
+    Client(["Client"])
+
+    subgraph torchrun["torchrun --nproc_per_node=2"]
+        subgraph P0["Process 0 — cuda:0"]
+            API0["FastAPI\n(rank 0 only)"]
+            Engine0["engine.py\nrank=0"]
+            GPU0["GPU 0\nfull attention weights\nMLP shard [:half]"]
+        end
+
+        subgraph P1["Process 1 — cuda:1"]
+            Engine1["engine.py\nrank=1"]
+            GPU1["GPU 1\nfull attention weights\nMLP shard [half:]"]
+        end
+
+        GPU0 <-->|"dist.all_reduce()\nNCCL ring-allreduce\nNVLink P2P ~10µs"| GPU1
+    end
+
+    Client -->|"POST /generate"| API0
+    API0 --> Engine0
+    Engine0 --> GPU0
+    Engine1 --> GPU1
+```
 
 ---
 
