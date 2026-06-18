@@ -26,8 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from engine import DistributedEngine
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="[rank %(rank)s] %(message)s",
+    level=logging.WARNING,
 )
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "mistralai/Mistral-7B-Instruct-v0.3")
