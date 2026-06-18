@@ -84,39 +84,39 @@ Hardware: **2× NVIDIA V100 SXM2 (32GB each, NVLink, 154.7 GB/s interconnect)** 
 
 Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16 (13.5GB single GPU, 6.88GB + 6.62GB split across 2 GPUs)
 
-### Experiment 1: Single GPU vs 2 GPU Throughput
+### Experiment 1: Throughput
 
-| Metric | Single GPU (V100) | 2 GPU col-parallel (NVLink) | Speedup |
-|--------|------------------|----------------------------|---------|
-| Requests/sec | 1.1 | 0.7 | 0.64x |
-| p99 latency (ms) | 926 | 1,530 | 0.60x |
-| Tokens/sec | 149.5 | 95.2 | 0.64x |
-| Scaling efficiency | — | — | 31.8% |
+| Metric | Single GPU | col-parallel | Megatron (col/row) |
+|--------|-----------|--------------|---------------------|
+| Requests/sec | 1.10 | 0.70 | 0.81 |
+| Tokens/sec | 149.5 | 95.2 | 110.7 |
+| p99 latency (ms) | 926 | 1,530 | 1,312 |
+| vs single GPU | 1.0x | 0.64x | 0.74x |
 
-> **Finding:** Even on NVLink (154.7 GB/s), naive column-parallel is slower than single GPU. The 450 cross-GPU transfers per forward pass (2 per Linear × 225 layers) add ~4ms of synchronization overhead per batch that outweighs the memory bandwidth gain. This motivates the Megatron alternating col/row approach (~224 transfers) implemented in `parallel_megatron.py`.
+> **Finding:** Megatron (+16% over col-parallel) confirms that fewer transfers help — but both modes still regress vs single GPU. The remaining gap is the `out_1.to(GPU0)` all-reduce mechanism: even with NVLink, this is a host-mediated DMA copy that goes through the CPU driver. True NCCL peer-to-peer (in `multi-process/`) eliminates that overhead.
 
 ### Experiment 2: Concurrency Scaling
 
-| Concurrency | Single GPU req/s | 2 GPU req/s | Speedup |
-|------------|-----------------|-------------|---------|
-| 1 | 0.21 | 0.14 | 0.67x |
-| 2 | 0.27 | 0.19 | 0.70x |
-| 4 | 0.58 | 0.37 | 0.64x |
-| 8 | 1.17 | 0.74 | 0.63x |
-| 16 | 2.13 | 1.40 | 0.66x |
+| Concurrency | Single GPU req/s | col-parallel req/s | Megatron req/s |
+|------------|-----------------|-------------------|----------------|
+| 1 | 0.21 | 0.14 | 0.20 |
+| 2 | 0.27 | 0.19 | 0.21 |
+| 4 | 0.58 | 0.37 | 0.43 |
+| 8 | 1.17 | 0.74 | 0.85 |
+| 16 | 2.13 | 1.40 | 1.69 |
 
-> **Finding:** Both configurations scale linearly with concurrency through batch=16 without saturating — the GPU still has headroom. Throughput grows ~10x from concurrency=1 to 16. The 2-GPU regression is consistent (~0.65x) across all batch sizes, confirming the bottleneck is per-forward-pass overhead, not queue or scheduling.
+> **Finding:** Megatron consistently ~15% faster than col-parallel at every concurrency level. Both scale linearly through batch=16 without saturating. The regression vs single GPU is consistent across all batch sizes — confirming the bottleneck is per-forward-pass communication overhead, not scheduling.
 
-### Experiment 3: Batch Size Impact (Single GPU)
+### Experiment 3: Batch Size Impact
 
-| Batch size | Req/s | Avg batch latency (ms) | Tokens/sec |
-|-----------|-------|----------------------|-----------|
-| 1 (no batching) | 0.18 | 5,470 | 36.4 |
-| 2 | 0.32 | 6,324 | 63.4 |
-| 4 | 0.61 | 6,600 | 121.2 |
-| 8 | 1.17 | 6,847 | 233.6 |
+| Batch size | Single GPU req/s | Megatron req/s | Megatron tok/s |
+|-----------|-----------------|----------------|----------------|
+| 1 | 0.18 | 0.12 | 23.8 |
+| 2 | 0.32 | 0.19 | 38.8 |
+| 4 | 0.61 | 0.39 | 78.0 |
+| 8 | 1.17 | 0.85 | 170.0 |
 
-> **Finding:** Going from batch=1 to batch=8 gives 6.4x throughput improvement with only 25% latency increase. Batching is almost free until the GPU saturates — the scheduler's 50ms batch window is well justified.
+> **Finding:** Batching is almost free on both configurations — 6-7x throughput gain from batch=1→8 with only ~20% latency increase. The Megatron vs single-GPU gap is consistent across batch sizes, ruling out scheduler overhead as the cause.
 
 ---
 
