@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s       # poll /metrics every 15 seconds
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "inference_api"
+    static_configs:
+      - targets: ["api:8000"]   # docker-compose service name resolves automatically
+    metrics_path: /metrics

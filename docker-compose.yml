@@ -1,0 +1,85 @@
+services:
+
+  # -------------------------------------------------------------------------
+  # Inference API server
+  # -------------------------------------------------------------------------
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}                    # set in your shell or .env file
+      - MODEL_NAME=${MODEL_NAME:-meta-llama/Llama-3.2-3B-Instruct}
+      - NUM_GPUS=${NUM_GPUS:-1}
+      - BATCH_WINDOW_MS=${BATCH_WINDOW_MS:-50}
+      - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-8}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all                         # expose all GPUs to the container
+              capabilities: [gpu]
+    volumes:
+      # Cache HuggingFace model weights across container restarts.
+      # Without this, every `docker compose up` re-downloads 14GB.
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s                        # give model time to load
+
+  # -------------------------------------------------------------------------
+  # Redis — request queue
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+
+  # -------------------------------------------------------------------------
+  # Prometheus — metrics collection
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+
+  # -------------------------------------------------------------------------
+  # Grafana — metrics dashboard
+  # -------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true          # no login needed locally
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./dashboard/grafana_config.json:/etc/grafana/provisioning/dashboards/inference.json:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  hf_cache:
+  prometheus_data:
+  grafana_data:
