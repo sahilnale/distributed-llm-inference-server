@@ -66,36 +66,46 @@ Both GPUs load their half simultaneously — doubling effective memory bandwidth
 
 ## Benchmark Results
 
-> Results from 2× NVIDIA A10G (24GB each) on Vast.ai — fill in after running.
+Two hardware configurations tested on Vast.ai:
+- **2× NVIDIA A10 (22GB each, PCIe 4.0, 12.3 GB/s interconnect)** — shows communication bottleneck
+- **2× NVIDIA V100 (16GB each, NVLink, 154.7 GB/s interconnect)** — shows speedup with fast interconnect *(pending)*
+
+Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16 (13.5GB single GPU, 6.88GB + 6.62GB split across 2 GPUs)
 
 ### Experiment 1: Single GPU vs 2 GPU Throughput
 
-| Metric | Single GPU | 2 GPU | Speedup |
-|--------|-----------|-------|---------|
-| Requests/sec | — | — | —x |
-| Avg latency (ms) | — | — | —x |
-| p99 latency (ms) | — | — | — |
-| Tokens/sec | — | — | —x |
-| Scaling efficiency | — | — | —% |
+| Metric | Single GPU (A10) | 2 GPU (A10, PCIe) | Speedup |
+|--------|-----------------|-------------------|---------|
+| Requests/sec | 0.95 | 0.70 | 0.74x |
+| Avg latency (ms) | 1,011 | 1,372 | 0.74x |
+| p99 latency (ms) | 1,080 | 1,541 | — |
+| Tokens/sec | 130.9 | 95.4 | 0.73x |
+| Scaling efficiency | — | — | 36.8% |
+
+> **Finding:** 2-GPU with PCIe interconnect (12.3 GB/s) is slower than single GPU. The all-reduce after every Linear layer costs more time than the bandwidth gain from splitting weights. NVLink (154.7 GB/s) is required for positive speedup — results pending on V100 NVLink instance.
 
 ### Experiment 2: Concurrency Scaling
 
-| Concurrency | Single GPU req/s | 2 GPU req/s | Speedup |
-|------------|-----------------|------------|---------|
-| 1 | — | — | — |
-| 2 | — | — | — |
-| 4 | — | — | — |
-| 8 | — | — | — |
-| 16 | — | — | — |
+| Concurrency | Single GPU req/s | 2 GPU req/s (PCIe) | Single GPU tok/s | 2 GPU tok/s |
+|------------|-----------------|-------------------|-----------------|------------|
+| 1 | 0.19 | 0.14 | 37.9 | 28.3 |
+| 2 | 0.27 | 0.19 | 53.7 | 37.7 |
+| 4 | 0.52 | 0.37 | 104.3 | 74.7 |
+| 8 | 0.99 | 0.73 | 197.6 | 146.7 |
+| 16 | 1.78 | 1.34 | 356.9 | 268.1 |
 
-### Experiment 3: Batch Window Impact (2 GPU)
+> **Finding:** Both configurations scale linearly with concurrency up to batch=16 without saturating — the GPU still has headroom. Throughput increases 9x (single) and 9.6x (multi) from concurrency=1 to 16, while latency only increases ~70%. The GPU is underutilized at low concurrency regardless of configuration.
 
-| Batch size | Req/s | Avg latency (ms) | Tokens/sec |
-|-----------|-------|-----------------|-----------|
-| 1 (no batching) | — | — | — |
-| 2 | — | — | — |
-| 4 | — | — | — |
-| 8 | — | — | — |
+### Experiment 3: Batch Size Impact (Single GPU)
+
+| Batch size | Req/s | Avg batch latency (ms) | Tokens/sec |
+|-----------|-------|----------------------|-----------|
+| 1 (no batching) | 0.15 | 6,826 | 29.3 |
+| 2 | 0.27 | 7,389 | 54.1 |
+| 4 | 0.52 | 7,678 | 104.2 |
+| 8 | 0.99 | 8,098 | 197.6 |
+
+> **Finding:** Going from batch=1 to batch=8 gives 6.7x throughput improvement (29.3 → 197.6 tok/s) with only 19% latency increase (6.8s → 8.1s). Batching is almost free until the GPU saturates — the scheduler's 50ms batch window is well justified.
 
 ---
 
@@ -105,9 +115,9 @@ Both GPUs load their half simultaneously — doubling effective memory bandwidth
 
 Pipeline parallelism splits layers across GPUs (GPU 0 runs layers 1-16, GPU 1 runs layers 17-32). At low concurrency this creates idle time — GPU 1 waits for GPU 0 to finish before it can start. This "pipeline bubble" kills single-request latency.
 
-Tensor parallelism splits each weight matrix across GPUs. Both GPUs work on every layer simultaneously. No idle time. The tradeoff is communication overhead — an all-reduce after every layer. On NVLink this is negligible. On PCIe it costs ~10-15% efficiency.
+Tensor parallelism splits each weight matrix across GPUs. Both GPUs work on every layer simultaneously. No idle time. The tradeoff is communication overhead — an all-reduce after every layer. On NVLink (154.7 GB/s) this is negligible. On PCIe (12.3 GB/s) it costs more than the bandwidth gain — as our A10 benchmark shows (0.73x speedup, i.e. a regression).
 
-For a 2-GPU setup at the concurrency levels we benchmark, tensor parallelism wins on both latency and throughput.
+This is why production tensor parallelism deployments exclusively use NVLink-connected hardware (A100 SXM, H100 SXM). The V100 NVLink benchmark will confirm the positive speedup on fast interconnect.
 
 ### Why Redis for the queue instead of an in-memory queue?
 
