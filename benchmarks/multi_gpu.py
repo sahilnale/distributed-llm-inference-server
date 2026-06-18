@@ -6,13 +6,18 @@ Runs two parallelism strategies back-to-back for direct comparison:
   megatron — Megatron-style col/row alternation (parallel_megatron.py), ~224 transfers/pass
              Reference: Shoeybi et al. (2019) arXiv:1909.08053
 
+Usage:
+  python benchmarks/multi_gpu.py                  # run both modes
+  python benchmarks/multi_gpu.py --mode column    # column only
+  python benchmarks/multi_gpu.py --mode megatron  # megatron only
+
 Results written to:
   benchmarks/results/multi_gpu_column.json
   benchmarks/results/multi_gpu_megatron.json
 """
 
+import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -65,6 +70,15 @@ def run_mode(mode: str) -> dict:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["column", "megatron", "both"],
+        default="both",
+        help="Which parallelism mode to benchmark (default: both)",
+    )
+    args = parser.parse_args()
+
     if torch.cuda.device_count() < 2:
         print("ERROR: Multi-GPU benchmark requires at least 2 GPUs.")
         print(f"Found: {torch.cuda.device_count()} GPU(s)")
@@ -75,25 +89,24 @@ def main():
         props = torch.cuda.get_device_properties(i)
         print(f"  cuda:{i} — {props.name}, {props.total_memory / 1024**3:.1f}GB VRAM")
 
-    column_results  = run_mode("column")
-    megatron_results = run_mode("megatron")
+    modes = ["column", "megatron"] if args.mode == "both" else [args.mode]
+    all_results = {mode: run_mode(mode) for mode in modes}
 
-    # Quick comparison summary
-    col_thr  = column_results["throughput"]
-    meg_thr  = megatron_results["throughput"]
-    print(f"\n{'='*60}")
-    print("COMPARISON SUMMARY")
-    print(f"{'='*60}")
-    print(f"{'Metric':<30} {'column':>10} {'megatron':>10}")
-    print(f"{'-'*50}")
-    print(f"{'req/s':<30} {col_thr['requests_per_sec']:>10.2f} {meg_thr['requests_per_sec']:>10.2f}")
-    print(f"{'avg latency (ms)':<30} {col_thr['avg_latency_ms']:>10.1f} {meg_thr['avg_latency_ms']:>10.1f}")
-    print(f"{'tokens/s':<30} {col_thr['tokens_per_sec']:>10.1f} {meg_thr['tokens_per_sec']:>10.1f}")
+    if len(modes) == 2:
+        col_thr = all_results["column"]["throughput"]
+        meg_thr = all_results["megatron"]["throughput"]
+        print(f"\n{'='*60}")
+        print("COMPARISON SUMMARY")
+        print(f"{'='*60}")
+        print(f"{'Metric':<30} {'column':>10} {'megatron':>10}")
+        print(f"{'-'*50}")
+        print(f"{'req/s':<30} {col_thr['requests_per_sec']:>10.2f} {meg_thr['requests_per_sec']:>10.2f}")
+        print(f"{'avg latency (ms)':<30} {col_thr['avg_latency_ms']:>10.1f} {meg_thr['avg_latency_ms']:>10.1f}")
+        print(f"{'tokens/s':<30} {col_thr['tokens_per_sec']:>10.1f} {meg_thr['tokens_per_sec']:>10.1f}")
+        improvement = (meg_thr["requests_per_sec"] / col_thr["requests_per_sec"] - 1) * 100
+        print(f"\nMegatron vs column speedup: {improvement:+.1f}%")
 
-    improvement = (meg_thr["requests_per_sec"] / col_thr["requests_per_sec"] - 1) * 100
-    print(f"\nMegatron vs column speedup: {improvement:+.1f}%")
-
-    return {"column": column_results, "megatron": megatron_results}
+    return all_results
 
 
 if __name__ == "__main__":
