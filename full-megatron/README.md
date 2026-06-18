@@ -24,6 +24,42 @@ This folder also parallelizes attention:
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TD
+    Client(["Client"])
+
+    subgraph torchrun["torchrun --nproc_per_node=2"]
+        subgraph P0["Process 0 — cuda:0"]
+            GPU0A["Attention\nq heads 0–15\nkv heads 0–3"]
+            GPU0M["MLP\ngate[:half] up[:half]\ndown[:,:half]"]
+            GPU0A --> GPU0M
+        end
+
+        subgraph P1["Process 1 — cuda:1"]
+            GPU1A["Attention\nq heads 16–31\nkv heads 4–7"]
+            GPU1M["MLP\ngate[half:] up[half:]\ndown[:,half:]"]
+            GPU1A --> GPU1M
+        end
+
+        GPU0A <-->|"dist.all_reduce o_proj\nNCCL NVLink"| GPU1A
+        GPU0M <-->|"dist.all_reduce down_proj\nNCCL NVLink"| GPU1M
+    end
+
+    Client --> P0
+```
+
+**Per transformer block:**
+- Both GPUs receive the same input `x` (broadcast once per batch)
+- Attention: each GPU runs attention on its 16 heads independently — no communication during the computation, one NCCL all_reduce on `o_proj` output
+- MLP: col-parallel gate/up (no comm), row-parallel down with NCCL all_reduce
+- Both GPUs now hold the identical full output, ready for the next layer
+
+**Total NCCL calls:** 2 per block × 32 blocks = 64 — same count as `multi-process/` but now attention compute is also halved, not just MLP.
+
+---
+
 ## How Attention Parallelism Works
 
 Mistral 7B has 32 query heads and 8 KV heads (GQA, 4:1 ratio), head_dim=128.
