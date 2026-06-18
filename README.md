@@ -1,5 +1,7 @@
 # Distributed LLM Inference Server
 
+> Built a distributed LLM inference server implementing four tensor parallelism strategies on Mistral-7B — progressing from a 0.64x regression to a 1.05x speedup over single GPU via Megatron-style MLP + attention head splitting across 2× V100 SXM2 with NVLink.
+
 A production-grade LLM inference server with a batching HTTP API, Redis request queue, Prometheus metrics, and Grafana dashboards — built on top of four progressively better GPU parallelism strategies, going from a 0.64x regression to a 1.05x speedup over single GPU.
 
 **Model:** `mistralai/Mistral-7B-Instruct-v0.3` in fp16  
@@ -281,3 +283,15 @@ distributed-llm-inference-server/
     │   └── engine.py
     └── benchmarks/benchmark.py
 ```
+
+---
+
+## Key Insights
+
+- **`.to()` routes through the CPU driver regardless of hardware** — even on NVLink (154 GB/s), manual tensor copies go GPU → CPU → GPU. Switching to `dist.all_reduce()` (NCCL) was the single biggest win, jumping from 0.74x to 0.95x without changing the parallelism strategy at all.
+
+- **Attention is ~35% of compute — replicating it caps speedup at 0.95x** — MLP-only tensor parallelism nearly closed the gap to single GPU, but both GPUs were still running identical attention computations. Splitting attention heads was the final step that crossed 1x.
+
+- **Tensor parallelism is a batching optimization** — at concurrency=1, single GPU wins every time. The crossover is at concurrency=2. This is why production inference servers (vLLM, TGI) pair tensor parallelism with continuous batching — the communication overhead only makes sense when the GPU is saturated.
+
+- **GQA head ratios must be preserved per rank** — Mistral uses Grouped Query Attention (32 query heads, 8 KV heads, 4:1 ratio). When splitting across 2 GPUs, each rank gets 16q + 4kv = still 4:1. If the ratio breaks, `repeat_kv` produces wrong-shaped tensors and the forward pass silently produces garbage.
