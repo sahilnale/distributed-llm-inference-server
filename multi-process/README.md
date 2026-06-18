@@ -100,12 +100,15 @@ code path before deploying to multi-GPU hardware.
 
 *Run on 2× V100 SXM2 (32GB, NVLink 154.7 GB/s) on Vast.ai*
 
-| Metric | Single GPU | Single-process TP | **NCCL TP (this)** |
-|--------|-----------|-------------------|---------------------|
-| Requests/sec | 1.1 | 0.81 (Megatron) | TBD |
-| Tokens/sec | 149.5 | 110.7 | TBD |
-| p99 latency (ms) | 926 | 1,311 | TBD |
-| Speedup vs single | 1.0x | 0.74x | TBD |
+| Metric | Single GPU | Megatron `.to()` | **NCCL (this)** | Δ |
+|--------|-----------|-----------------|-----------------|---|
+| Requests/sec | 1.10 | 0.81 | **1.04** | +28% |
+| p99 latency (ms) | 926 | 1,312 | **1,020** | −22% |
+| vs single GPU | 1.0x | 0.74x | **0.95x** | +0.21x |
+
+NCCL closes 93% of the gap to single GPU, up from 74% with manual `.to()`.
+Remaining 5%: attention is still replicated (both GPUs run the same computation).
+Full head-parallel attention would likely push past 1x.
 
 ---
 

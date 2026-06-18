@@ -6,15 +6,16 @@ Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16. Hardware: 2× V100 SXM2 (32
 
 ## Implementations
 
-| | [`src/`](src/) — Single Process | [`multi-process/`](multi-process/) — NCCL |
-|---|---|---|
-| **How** | One Python process, 2 GPUs | One process per GPU, `torchrun` |
-| **All-reduce** | `.to()` + add (host-mediated DMA) | `dist.all_reduce()` (NCCL P2P) |
-| **Parallelism** | Naive col-parallel OR Megatron col/row | Megatron col/row (MLP only) |
-| **Launch** | `python benchmarks/multi_gpu.py` | `torchrun --nproc_per_node=2 ...` |
-| **Speedup vs 1 GPU** | 0.64x–0.81x (regression) | TBD (expected >1x) |
+| | Single GPU | [`single-process/`](single-process/) col-parallel | [`single-process/`](single-process/) Megatron | [`multi-process/`](multi-process/) NCCL |
+|---|---|---|---|---|
+| **req/s** | 1.10 | 0.70 | 0.81 | **1.04** |
+| **tok/s** | 149.5 | 95.2 | 110.7 | **208.2** |
+| **p99 (ms)** | 926 | 1,530 | 1,312 | **1,020** |
+| **vs single GPU** | 1.0x | 0.64x | 0.74x | **0.95x** |
+| **all-reduce** | — | `.to()` host DMA | `.to()` host DMA | `dist.all_reduce()` NCCL P2P |
+| **launch** | — | `python` | `python` | `torchrun` |
 
-**Key insight:** on NVLink hardware, the interconnect bandwidth (154 GB/s) isn't the bottleneck — *how you use it* is. `.to()` goes through the CPU driver and adds ~15–30μs per transfer regardless of hardware. NCCL stays peer-to-peer in GPU memory. Over 64 all-reduces per forward pass that difference compounds into measurable latency.
+**Key insight:** on NVLink hardware, the interconnect bandwidth (154 GB/s) isn't the bottleneck — *how you use it* is. `.to()` goes through the CPU driver regardless of hardware. NCCL ring-allreduce stays peer-to-peer in GPU SRAM. That difference — multiplied over 64 all-reduces per forward pass — takes the regression from 0.74x all the way to 0.95x. The remaining 5% gap is replicated attention (both GPUs compute the same attention); full head-parallel attention would close it.
 
 ---
 
