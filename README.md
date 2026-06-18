@@ -66,46 +66,43 @@ Both GPUs load their half simultaneously — doubling effective memory bandwidth
 
 ## Benchmark Results
 
-Two hardware configurations tested on Vast.ai:
-- **2× NVIDIA A10 (22GB each, PCIe 4.0, 12.3 GB/s interconnect)** — shows communication bottleneck
-- **2× NVIDIA V100 (16GB each, NVLink, 154.7 GB/s interconnect)** — shows speedup with fast interconnect *(pending)*
+Hardware: **2× NVIDIA V100 SXM2 (32GB each, NVLink, 154.7 GB/s interconnect)** on Vast.ai
 
 Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16 (13.5GB single GPU, 6.88GB + 6.62GB split across 2 GPUs)
 
 ### Experiment 1: Single GPU vs 2 GPU Throughput
 
-| Metric | Single GPU (A10) | 2 GPU (A10, PCIe) | Speedup |
-|--------|-----------------|-------------------|---------|
-| Requests/sec | 0.95 | 0.70 | 0.74x |
-| Avg latency (ms) | 1,011 | 1,372 | 0.74x |
-| p99 latency (ms) | 1,080 | 1,541 | — |
-| Tokens/sec | 130.9 | 95.4 | 0.73x |
-| Scaling efficiency | — | — | 36.8% |
+| Metric | Single GPU (V100) | 2 GPU col-parallel (NVLink) | Speedup |
+|--------|------------------|----------------------------|---------|
+| Requests/sec | 1.1 | 0.7 | 0.64x |
+| p99 latency (ms) | 926 | 1,530 | 0.60x |
+| Tokens/sec | 149.5 | 95.2 | 0.64x |
+| Scaling efficiency | — | — | 31.8% |
 
-> **Finding:** 2-GPU with PCIe interconnect (12.3 GB/s) is slower than single GPU. The all-reduce after every Linear layer costs more time than the bandwidth gain from splitting weights. NVLink (154.7 GB/s) is required for positive speedup — results pending on V100 NVLink instance.
+> **Finding:** Even on NVLink (154.7 GB/s), naive column-parallel is slower than single GPU. The 450 cross-GPU transfers per forward pass (2 per Linear × 225 layers) add ~4ms of synchronization overhead per batch that outweighs the memory bandwidth gain. This motivates the Megatron alternating col/row approach (~224 transfers) implemented in `parallel_megatron.py`.
 
 ### Experiment 2: Concurrency Scaling
 
-| Concurrency | Single GPU req/s | 2 GPU req/s (PCIe) | Single GPU tok/s | 2 GPU tok/s |
-|------------|-----------------|-------------------|-----------------|------------|
-| 1 | 0.19 | 0.14 | 37.9 | 28.3 |
-| 2 | 0.27 | 0.19 | 53.7 | 37.7 |
-| 4 | 0.52 | 0.37 | 104.3 | 74.7 |
-| 8 | 0.99 | 0.73 | 197.6 | 146.7 |
-| 16 | 1.78 | 1.34 | 356.9 | 268.1 |
+| Concurrency | Single GPU req/s | 2 GPU req/s | Speedup |
+|------------|-----------------|-------------|---------|
+| 1 | 0.21 | 0.14 | 0.67x |
+| 2 | 0.27 | 0.19 | 0.70x |
+| 4 | 0.58 | 0.37 | 0.64x |
+| 8 | 1.17 | 0.74 | 0.63x |
+| 16 | 2.13 | 1.40 | 0.66x |
 
-> **Finding:** Both configurations scale linearly with concurrency up to batch=16 without saturating — the GPU still has headroom. Throughput increases 9x (single) and 9.6x (multi) from concurrency=1 to 16, while latency only increases ~70%. The GPU is underutilized at low concurrency regardless of configuration.
+> **Finding:** Both configurations scale linearly with concurrency through batch=16 without saturating — the GPU still has headroom. Throughput grows ~10x from concurrency=1 to 16. The 2-GPU regression is consistent (~0.65x) across all batch sizes, confirming the bottleneck is per-forward-pass overhead, not queue or scheduling.
 
 ### Experiment 3: Batch Size Impact (Single GPU)
 
 | Batch size | Req/s | Avg batch latency (ms) | Tokens/sec |
 |-----------|-------|----------------------|-----------|
-| 1 (no batching) | 0.15 | 6,826 | 29.3 |
-| 2 | 0.27 | 7,389 | 54.1 |
-| 4 | 0.52 | 7,678 | 104.2 |
-| 8 | 0.99 | 8,098 | 197.6 |
+| 1 (no batching) | 0.18 | 5,470 | 36.4 |
+| 2 | 0.32 | 6,324 | 63.4 |
+| 4 | 0.61 | 6,600 | 121.2 |
+| 8 | 1.17 | 6,847 | 233.6 |
 
-> **Finding:** Going from batch=1 to batch=8 gives 6.7x throughput improvement (29.3 → 197.6 tok/s) with only 19% latency increase (6.8s → 8.1s). Batching is almost free until the GPU saturates — the scheduler's 50ms batch window is well justified.
+> **Finding:** Going from batch=1 to batch=8 gives 6.4x throughput improvement with only 25% latency increase. Batching is almost free until the GPU saturates — the scheduler's 50ms batch window is well justified.
 
 ---
 
@@ -115,9 +112,9 @@ Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16 (13.5GB single GPU, 6.88GB +
 
 Pipeline parallelism splits layers across GPUs (GPU 0 runs layers 1-16, GPU 1 runs layers 17-32). At low concurrency this creates idle time — GPU 1 waits for GPU 0 to finish before it can start. This "pipeline bubble" kills single-request latency.
 
-Tensor parallelism splits each weight matrix across GPUs. Both GPUs work on every layer simultaneously. No idle time. The tradeoff is communication overhead — an all-reduce after every layer. On NVLink (154.7 GB/s) this is negligible. On PCIe (12.3 GB/s) it costs more than the bandwidth gain — as our A10 benchmark shows (0.73x speedup, i.e. a regression).
+Tensor parallelism splits each weight matrix across GPUs. Both GPUs work on every layer simultaneously. No idle time. The tradeoff is communication overhead — an all-reduce after every layer. Even on V100 NVLink (154.7 GB/s), naive column-parallel shows a regression (0.64x) because 450 transfers per forward pass is too many synchronization points regardless of bandwidth.
 
-This is why production tensor parallelism deployments exclusively use NVLink-connected hardware (A100 SXM, H100 SXM). The V100 NVLink benchmark will confirm the positive speedup on fast interconnect.
+This is why production systems use Megatron-style alternating col/row parallelism — reducing MLP transfers from 6 to 2 per block brings total transfers from 450 to ~224. Implemented in `parallel_megatron.py`.
 
 ### Why Redis for the queue instead of an in-memory queue?
 
