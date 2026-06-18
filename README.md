@@ -72,17 +72,120 @@ Four implementations, each fixing one flaw in the previous:
 
 ### The Progression
 
-**Step 1 — Naive column-parallel: 0.64x**  
-Split every Linear weight in half, combine results with `.to()`. Simple, but 450 cross-GPU transfers per forward pass and every one goes through the CPU driver. Regression on both PCIe and NVLink hardware.
+**Step 1 — Naive column-parallel: 0.64x**
 
-**Step 2 — Megatron alternating col/row: 0.74x**  
-Chain column-parallel → row-parallel so intermediate results never need to be gathered — only one all-reduce at the end of each MLP block. Cuts transfers from 450 → ~224. Still regressing because `.to()` itself is the bottleneck, not the transfer count.
+Split every Linear weight in half, combine results with `.to()`. 450 cross-GPU transfers per forward pass, every one routed through the CPU driver.
 
-**Step 3 — NCCL multi-process, MLP only: 0.95x**  
-One OS process per GPU (`torchrun`), `dist.all_reduce()` instead of `.to()`. NCCL ring-allreduce stays peer-to-peer in GPU SRAM — no CPU involved, ~2.5x faster per call. MLP fully parallelized. Attention still replicated (both GPUs run the same computation), hence 0.95x not >1x.
+```mermaid
+flowchart LR
+    x(["x (input)"])
+    subgraph GPU0["GPU 0"]
+        W0["W[:half]\npartial out_0"]
+    end
+    subgraph GPU1["GPU 1"]
+        W1["W[half:]\npartial out_1"]
+    end
+    out(["output = cat(out_0, out_1)"])
 
-**Step 4 — Full Megatron, MLP + attention: 1.05x ✓**  
-Patch the attention module to split query heads (16/GPU) and KV heads (4/GPU). Mistral's GQA ratio (32q:8kv = 4:1) is preserved per rank, so attention math works identically on each GPU's subset. Now both MLP (65%) and attention (35%) are actually split — 2 GPUs finally beat 1.
+    x --> W0
+    x --> W1
+    W0 -->|"out_0"| out
+    W1 -->|"out_1.to(GPU0)\nCPU driver ~25µs"| out
+```
+
+2 transfers × 225 layers = **450 transfers/pass** — regression on every hardware config.
+
+---
+
+**Step 2 — Megatron alternating col/row: 0.74x**
+
+Chain col-parallel → row-parallel so intermediate results feed directly into the next layer with zero gather. Only one all-reduce at the end of each MLP block.
+
+```mermaid
+flowchart LR
+    x(["x"])
+    subgraph GPU0["GPU 0"]
+        G0["gate[:half]\nup[:half]"]
+        H0["h_0 = act·up"]
+        D0["down[:, :half]\npartial out_0"]
+        G0 --> H0 --> D0
+    end
+    subgraph GPU1["GPU 1"]
+        G1["gate[half:]\nup[half:]"]
+        H1["h_1 = act·up"]
+        D1["down[:, half:]\npartial out_1"]
+        G1 --> H1 --> D1
+    end
+    out(["output = out_0 + out_1.to(GPU0)"])
+
+    x --> G0
+    x --> G1
+    D0 --> out
+    D1 -->|"1 transfer via CPU driver"| out
+```
+
+2 transfers per MLP block — **~224 transfers/pass**. Still regressing because `.to()` itself goes through the CPU driver regardless of transfer count.
+
+---
+
+**Step 3 — NCCL multi-process, MLP only: 0.95x**
+
+One OS process per GPU. Replace `.to()` with `dist.all_reduce()` — NCCL ring-allreduce stays peer-to-peer in GPU SRAM, no CPU involved. MLP is now truly parallel. Attention is still replicated (both GPUs run identical computation).
+
+```mermaid
+flowchart LR
+    x(["x (broadcast\nfrom rank 0)"])
+    subgraph GPU0["Process 0 — cuda:0"]
+        MLP0["MLP shard [:half]"]
+        ATN0["Attention\n(full, replicated)"]
+    end
+    subgraph GPU1["Process 1 — cuda:1"]
+        MLP1["MLP shard [half:]"]
+        ATN1["Attention\n(full, replicated)"]
+    end
+    out(["output (rank 0)"])
+
+    x --> MLP0
+    x --> MLP1
+    x --> ATN0
+    x --> ATN1
+    MLP0 -->|"dist.all_reduce()\nNVLink P2P ~10µs"| out
+    MLP1 -->|"dist.all_reduce()"| out
+    ATN0 --> out
+```
+
+Attention is ~35% of compute — leaving it replicated caps the speedup at 0.95x.
+
+---
+
+**Step 4 — Full Megatron, MLP + attention: 1.05x ✓**
+
+Patch the attention module to split query heads (16/GPU) and KV heads (4/GPU). Mistral's GQA ratio (4:1) is preserved per rank, so attention math works identically. Both MLP and attention are now split — 2 GPUs finally beat 1.
+
+```mermaid
+flowchart LR
+    x(["x (broadcast)"])
+    subgraph GPU0["Process 0 — cuda:0"]
+        A0["Attn\nq heads 0–15\nkv heads 0–3"]
+        M0["MLP\nshard [:half]"]
+        A0 --> M0
+    end
+    subgraph GPU1["Process 1 — cuda:1"]
+        A1["Attn\nq heads 16–31\nkv heads 4–7"]
+        M1["MLP\nshard [half:]"]
+        A1 --> M1
+    end
+    out(["output (rank 0)"])
+
+    x --> A0
+    x --> A1
+    A0 -->|"all_reduce o_proj"| out
+    A1 -->|"all_reduce o_proj"| out
+    M0 -->|"all_reduce down_proj"| out
+    M1 -->|"all_reduce down_proj"| out
+```
+
+2 NCCL all_reduces per block × 32 blocks = 64 total — same count as step 3, but now attention compute is also halved.
 
 ---
 
