@@ -69,9 +69,6 @@ Four implementations, each fixing one flaw in the previous:
 | **req/s** | 1.10 | 0.70 | 0.81 | 1.04 | **1.15** |
 | **p99 (ms)** | 926 | 1,530 | 1,312 | 1,020 | **922** |
 | **vs single GPU** | 1.0x | 0.64x | 0.74x | 0.95x | **+1.05x** |
-| **MLP parallel** | — | `.to()` | `.to()` | NCCL ✓ | NCCL ✓ |
-| **Attn parallel** | — | `.to()` | `.to()` | replicated ✗ | NCCL ✓ |
-| **launch** | — | `python` | `python` | `torchrun` | `torchrun` |
 
 ### The Progression
 
