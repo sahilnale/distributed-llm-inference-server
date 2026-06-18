@@ -6,29 +6,33 @@ A distributed inference system that splits a Llama model across 2 GPUs using ten
 
 ## Architecture
 
-```
-                        ┌─────────────────────────────────────────┐
-                        │            Docker Compose                │
-                        │                                          │
-  HTTP Clients          │  ┌──────────┐      ┌─────────────────┐  │
-  ──────────────────────┼─▶│  FastAPI │─────▶│   Scheduler     │  │
-  POST /generate        │  │ server   │      │  (batch window) │  │
-  GET  /health          │  └──────────┘      └────────┬────────┘  │
-  GET  /metrics         │       │                     │           │
-                        │       │             ┌────────▼────────┐  │
-                        │  ┌────▼─────┐      │  InferenceEngine│  │
-  Prometheus ◀──scrape──┼──│ /metrics │      │                 │  │
-                        │  └──────────┘      │  ┌──────────┐   │  │
-  Grafana ◀─────────────┼──── dashboards     │  │  GPU 0   │   │  │
-                        │                    │  │  (7 GB)  │   │  │
-                        │  ┌──────────┐      │  └────┬─────┘   │  │
-                        │  │  Redis   │◀─────┤       │all-reduce│  │
-                        │  │  queue   │      │  ┌────▼─────┐   │  │
-                        │  └──────────┘      │  │  GPU 1   │   │  │
-                        │                    │  │  (7 GB)  │   │  │
-                        │                    │  └──────────┘   │  │
-                        │                    └─────────────────┘  │
-                        └─────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Client(["HTTP Clients\nPOST /generate\nGET /health\nGET /metrics"])
+    Prometheus(["Prometheus\nscrapes /metrics"])
+    Grafana(["Grafana\ndashboards"])
+
+    subgraph Docker Compose
+        API["FastAPI Server\nserver.py"]
+        Metrics["/metrics endpoint"]
+        Redis[("Redis\nqueue")]
+        Scheduler["Scheduler\nbatch window 50ms / max 8"]
+
+        subgraph InferenceEngine["Inference Engine — engine.py"]
+            GPU0["GPU 0\n7 GB — W_left"]
+            GPU1["GPU 1\n7 GB — W_right"]
+            GPU0 -- "all-reduce\n(sum partial results)" --> GPU1
+        end
+    end
+
+    Client -->|"POST /generate"| API
+    API --> Metrics
+    API --> Scheduler
+    Scheduler -->|"enqueue"| Redis
+    Redis -->|"dequeue batch"| Scheduler
+    Scheduler -->|"engine.generate(batch)"| InferenceEngine
+    Prometheus -->|"scrape"| Metrics
+    Grafana -->|"query"| Prometheus
 ```
 
 **Request flow:**
