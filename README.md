@@ -40,7 +40,7 @@ flowchart TD
 2. FastAPI handler enqueues it in Redis and awaits a Future
 3. Scheduler batch loop collects requests for 50ms (or until batch=8)
 4. Engine runs one GPU forward pass on the whole batch
-5. With 2 GPUs: each Linear layer is split across both GPUs, partial results summed via all-reduce
+5. With 2 GPUs: weights are split across both GPUs (`parallelism_mode` controls strategy — column-parallel or Megatron col/row alternation)
 6. Futures resolved, responses returned
 
 ---
@@ -128,11 +128,46 @@ An in-memory asyncio queue would be simpler, but Redis gives us:
 
 For a production inference server the Redis overhead is negligible compared to GPU time.
 
-### Why column parallelism vs Megatron-style alternating col/row?
+### Two tensor parallelism strategies — naive column-parallel vs Megatron
 
-We use column parallelism for every Linear layer (split output features, concatenate results). Megatron-LM alternates column and row parallel layers so the output of one feeds directly into the next without a gather step — halving inter-GPU communication.
+This project implements both approaches so the communication overhead is measurable, not just theoretical.
 
-We chose column-only because it's easier to reason about and implement correctly. The benchmark will show ~80-90% scaling efficiency rather than ~95%. That gap is worth explaining: it quantifies the communication overhead and demonstrates why production systems invest in the more complex alternating approach.
+**Method 1: Naive column-parallel** (`src/parallel.py`)
+
+Every Linear layer is treated the same: split output features across GPUs, gather results back.
+
+```
+For each Linear(in, out):
+  GPU0: x → W0(out//2, in) → partial_0    (1 transfer in)
+  GPU1: x → W1(out//2, in) → partial_1    (1 transfer in)
+  output = cat([partial_0, partial_1])      (1 transfer out)
+```
+
+Cost: 2 transfers × 225 layers = **450 cross-GPU transfers per forward pass**.
+
+**Method 2: Megatron-style alternating col/row** (`src/parallel_megatron.py`)
+
+Reference: Shoeybi et al., *Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism* (2019). [arXiv:1909.08053](https://arxiv.org/abs/1909.08053)
+
+The key insight from the paper: a column-parallel layer produces output **already split** across GPUs. A row-parallel layer expects input **already split** across GPUs. Back-to-back col→row layers need **zero communication** in the middle — only one all-reduce at the end of the pair.
+
+Applied to the MLP block (gate/up/down projections):
+```
+gate_proj, up_proj: column-parallel  → output stays split across GPUs (NO gather)
+down_proj:          row-parallel     → takes the split input, sums via all-reduce
+
+GPU0: gate_0 = x @ G0.T  ||  GPU1: gate_1 = x @ G1.T   [no transfer between]
+GPU0: up_0   = x @ U0.T  ||  GPU1: up_1   = x @ U1.T   [no transfer between]
+GPU0: h_0 = act(gate_0)*up_0  ||  GPU1: h_1 = act(gate_1)*up_1  [no comm]
+GPU0: out_0 = h_0 @ D0.T  ||  GPU1: out_1 = h_1 @ D1.T   [row parallel]
+output = out_0 + out_1.to(GPU0)   [all-reduce — only 1 transfer out]
+```
+
+Cost per MLP block: **2 transfers** (copy x in, sum out) vs 6 in naive approach.
+
+Total: ~64 MLP transfers + ~160 attention transfers = **~224 transfers per forward pass** — roughly 2× fewer syncs than naive.
+
+The benchmarks quantify this gap. On NVLink (154.7 GB/s) the savings are real; on PCIe (12.3 GB/s) even the cheaper Megatron approach struggles because the interconnect itself is the bottleneck.
 
 ### Why fp16 instead of int8/int4 quantization?
 
@@ -225,16 +260,17 @@ NUM_GPUS=2 docker compose up --build
 ```
 distributed-inference/
 ├── src/
-│   ├── server.py       FastAPI app, routes, lifespan
-│   ├── engine.py       Model loading, generate() method
-│   ├── parallel.py     Tensor parallelism — splits Linear layers across GPUs
-│   ├── scheduler.py    Redis queue, batch window, Future resolution
-│   └── metrics.py      Prometheus counters, histograms, gauges
+│   ├── server.py              FastAPI app, routes, lifespan
+│   ├── engine.py              Model loading, generate() — parallelism_mode param
+│   ├── parallel.py            Naive column-parallel (450 transfers/pass)
+│   ├── parallel_megatron.py   Megatron-style col/row alternation (~224 transfers/pass)
+│   ├── scheduler.py           Redis queue, batch window, Future resolution
+│   └── metrics.py             Prometheus counters, histograms, gauges
 ├── benchmarks/
-│   ├── single_gpu.py   Single GPU experiments
-│   ├── multi_gpu.py    2-GPU experiments (reuses single_gpu functions)
-│   ├── run_benchmarks.py  Runs both, computes speedup, prints summary
-│   └── results/        JSON output files
+│   ├── single_gpu.py          Single GPU experiments
+│   ├── multi_gpu.py           2-GPU experiments — runs both parallelism modes
+│   ├── run_benchmarks.py      Runs all, computes speedup, prints summary
+│   └── results/               JSON output files (one per mode)
 ├── dashboard/
 │   └── grafana_config.json
 ├── Dockerfile

@@ -9,13 +9,16 @@ Lifecycle:
 
 Single vs multi-GPU:
   - NUM_GPUS=1: model loads entirely onto cuda:0.
-  - NUM_GPUS=2: parallel.py shards weight matrices across cuda:0 and cuda:1.
-    After that, generate() is identical — parallelism is transparent.
+  - NUM_GPUS=2: parallelism_mode controls sharding strategy:
+      "column"  — naive column-parallel everywhere (parallel.py)
+                  Simple, 450 cross-GPU transfers per forward pass.
+      "megatron" — alternating col/row parallel for MLP blocks (parallel_megatron.py)
+                  Implements Megatron-LM (Shoeybi et al., 2019) arXiv:1909.08053.
+                  ~224 transfers per forward pass — roughly 2x fewer syncs.
 """
 
 import os
 import logging
-from typing import Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -24,6 +27,8 @@ import metrics
 
 logger = logging.getLogger(__name__)
 
+PARALLELISM_MODES = ("column", "megatron")
+
 
 class InferenceEngine:
     def __init__(
@@ -31,10 +36,14 @@ class InferenceEngine:
         model_name: str,
         num_gpus: int = 1,
         max_batch_size: int = 8,
+        parallelism_mode: str = "column",
     ):
+        if parallelism_mode not in PARALLELISM_MODES:
+            raise ValueError(f"parallelism_mode must be one of {PARALLELISM_MODES}")
         self.model_name = model_name
         self.num_gpus = num_gpus
         self.max_batch_size = max_batch_size
+        self.parallelism_mode = parallelism_mode
 
         if not torch.cuda.is_available():
             raise RuntimeError("No CUDA GPUs found. This server requires at least one GPU.")
@@ -86,10 +95,7 @@ class InferenceEngine:
         )
 
     def _load_multi_gpu(self) -> AutoModelForCausalLM:
-        # Import here so single-GPU mode doesn't need torch.distributed
-        from parallel import apply_tensor_parallelism
-
-        # Load onto CPU first — parallel.py will move shards to each GPU
+        # Load onto CPU first — parallelism sharding moves weights to each GPU
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             token=os.environ.get("HF_TOKEN"),
@@ -97,10 +103,19 @@ class InferenceEngine:
             device_map="cpu",
         )
 
-        # apply_tensor_parallelism modifies model in-place:
-        # splits Linear weight matrices across cuda:0 and cuda:1,
-        # and patches each layer's forward() to do the all-reduce.
-        apply_tensor_parallelism(model, devices=["cuda:0", "cuda:1"])
+        devices = ["cuda:0", "cuda:1"]
+        if self.parallelism_mode == "megatron":
+            # Megatron-style: MLP blocks use alternating col/row (2 transfers per block)
+            # Attention projections use col-parallel from parallel.py
+            # Reference: Shoeybi et al. (2019) arXiv:1909.08053
+            from parallel_megatron import apply_megatron_tensor_parallelism
+            apply_megatron_tensor_parallelism(model, devices=devices)
+        else:
+            # Naive column-parallel: every Linear layer copied-in, concatenated-out
+            # 450 cross-GPU transfers per forward pass
+            from parallel import apply_tensor_parallelism
+            apply_tensor_parallelism(model, devices=devices)
+
         return model
 
     # ------------------------------------------------------------------
