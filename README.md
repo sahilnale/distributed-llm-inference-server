@@ -6,16 +6,18 @@ Model: `mistralai/Mistral-7B-Instruct-v0.3` in fp16. Hardware: 2× V100 SXM2 (32
 
 ## Implementations
 
-| | Single GPU | [`single-process/`](single-process/) col-parallel | [`single-process/`](single-process/) Megatron | [`multi-process/`](multi-process/) NCCL |
-|---|---|---|---|---|
-| **req/s** | 1.10 | 0.70 | 0.81 | **1.04** |
-| **tok/s** | 149.5 | 95.2 | 110.7 | **208.2** |
-| **p99 (ms)** | 926 | 1,530 | 1,312 | **1,020** |
-| **vs single GPU** | 1.0x | 0.64x | 0.74x | **0.95x** |
-| **all-reduce** | — | `.to()` host DMA | `.to()` host DMA | `dist.all_reduce()` NCCL P2P |
-| **launch** | — | `python` | `python` | `torchrun` |
+| | Single GPU | col-parallel | Megatron `.to()` | NCCL MLP-only | **Full Megatron** |
+|---|---|---|---|---|---|
+| **req/s** | 1.10 | 0.70 | 0.81 | 1.04 | **1.15** |
+| **p99 (ms)** | 926 | 1,530 | 1,312 | 1,020 | **922** |
+| **vs single GPU** | 1.0x | 0.64x | 0.74x | 0.95x | **+1.05x** |
+| **MLP parallel** | — | `.to()` | `.to()` | NCCL ✓ | NCCL ✓ |
+| **Attn parallel** | — | `.to()` | `.to()` | replicated ✗ | NCCL ✓ |
+| **launch** | — | `python` | `python` | `torchrun` | `torchrun` |
 
-**Key insight:** on NVLink hardware, the interconnect bandwidth (154 GB/s) isn't the bottleneck — *how you use it* is. `.to()` goes through the CPU driver regardless of hardware. NCCL ring-allreduce stays peer-to-peer in GPU SRAM. That difference — multiplied over 64 all-reduces per forward pass — takes the regression from 0.74x all the way to 0.95x. The remaining 5% gap is replicated attention (both GPUs compute the same attention); full head-parallel attention would close it.
+Each step fixes exactly one thing and the result is measurable. The final jump from 0.95x → 1.05x came from parallelizing attention heads — once both MLP (65%) and attention (35%) are split, 2 GPUs finally beat 1.
+
+**Key insight:** on NVLink hardware, the interconnect bandwidth (154 GB/s) isn't the bottleneck — *how you use it* is. `.to()` goes through the CPU driver regardless of bandwidth. NCCL ring-allreduce stays peer-to-peer in GPU SRAM. And parallelism only helps if you actually parallelize everything — leaving attention replicated kept us at 0.95x until the full split crossed 1x.
 
 ---
 
